@@ -1,102 +1,193 @@
-/* COMPSCI 424 Program 3
-   Name:
-   
-   p3main.cpp: contains the main function for this program.
-
-   This is a template. Feel free to edit any of these files, even
-   these pre-written comments or my provided code. You can add any
-   classes, methods, and data structures that you need to solve the
-   problem and display your solution in the correct format.
-*/
-
-// You will probably need to add more #include directives.
-// Remember: use <angle brackets> for standard C++ headers/libraries
-// and "double quotes" for headers in the same directory as this file.
 #include <iostream>
 #include <fstream>
 #include <string>
-#include <cstdio> // for sscanf because Dr. Oster likes the C way to
-                  // get data from strings better than the C++ way
-using namespace std; // if you want to type out "std::" every time, delete this
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <sstream>
+#include <random>
+#include <chrono>
 
-/*
-   If you want your variables and data structures for the banker's
-   algorithm to have global scope, declare them here. This may make
-   the rest of your program easier to write. 
-   
-   Most software engineers say global variables are a Bad Idea (and 
-   they're usually correct!), but systems programmers do it all the
-   time, so I'm allowing it here.
-*/
+using namespace std;
 
+int num_resources, num_processes;
+vector<int> Available;
+vector<vector<int>> Max;
+vector<vector<int>> Allocation;
+vector<vector<int>> Need;
+mutex mtx;
 
-/*
-  Arguments:
-    argc: the number of command-line arguments, which should be >= 2
-    argv[0]: the name of the executable file
-    argv[1]: a C-string, either "manual" or "auto"
-    argv[2]: a C-string containing the name of the setup file (and the
-             path to the file, if it's not in the current directory)
-*/
-int main (int argc, char *argv[]) {
-    // To help you get started, the major steps for the main program
-    // are shown here as comments. Feel free to add more comments to
-    // help you understand your code, or for any reason. Also feel free
-    // to edit this comment to be more helpful.
+bool is_safe() {
+    vector<int> work = Available;
+    vector<bool> finish(num_processes, false);
 
-    // Code to test command-line processing. You can keep, modify, or
-    // remove this code. It's not required.
-    if (argc < 2) {
-        cerr << argc << " command-line arguments provided, 2 expected; exiting." << endl;
-        if (argc == 1) cerr << "argv[1] == " << argv[1] << endl;
-        return 1; // non-zero return value indicates abnormal termination
+    while (true) {
+        bool progress = false;
+        for (int i = 0; i < num_processes; ++i) {
+            if (!finish[i]) {
+                bool can_finish = true;
+                for (int j = 0; j < num_resources; ++j) {
+                    if (Need[i][j] > work[j]) {
+                        can_finish = false;
+                        break;
+                    }
+                }
+                if (can_finish) {
+                    for (int j = 0; j < num_resources; ++j)
+                        work[j] += Allocation[i][j];
+                    finish[i] = true;
+                    progress = true;
+                }
+            }
+        }
+        if (!progress) break;
     }
 
-    cout << "Selected mode: " << argv[1] << endl;
-    cout << "Setup file location: " << argv[2] << endl;
+    return all_of(finish.begin(), finish.end(), [](bool done) { return done; });
+}
 
-    // 1. Open the setup file using the path in argv[2]
-    ifstream setup_file;
-    string line;
-    int num_resources;
-    int num_processes;
+bool request_resources(int pid, vector<int> req) {
+    lock_guard<mutex> lock(mtx);
+    cout << "Process " << pid << " requests ";
+    for (int i = 0; i < num_resources; ++i) cout << req[i] << " ";
 
-    setup_file.open(argv[2], ios::in);
-    if (setup_file.is_open()) {
-        // 2. Get the number of resources and processes from the setup
-        // file, and use this info to create the Banker's Algorithm
-        // data structures
-        setup_file >> num_resources;
-        cout << num_resources << " resources" << endl;
+    for (int i = 0; i < num_resources; ++i) {
+        if (req[i] > Need[pid][i] || req[i] > Available[i]) {
+            cout << ": denied (invalid request)\n";
+            return false;
+        }
+    }
+    for (int i = 0; i < num_resources; ++i) {
+        Available[i] -= req[i];
+        Allocation[pid][i] += req[i];
+        Need[pid][i] -= req[i];
+    }
+    if (is_safe()) {
+        cout << ": granted\n";
+        return true;
+    }
+    else {
+        for (int i = 0; i < num_resources; ++i) {
+            Available[i] += req[i];
+            Allocation[pid][i] -= req[i];
+            Need[pid][i] += req[i];
+        }
+        cout << ": denied (unsafe state)\n";
+        return false;
+    }
+}
 
-        getline(setup_file, line); // skips the rest of the "resources" line
-        
-        setup_file >> num_processes;
-        cout << num_processes << " processes" << endl;
-        
-        getline(setup_file, line); // skips the rest of the "processes" line
+bool release_resources(int pid, vector<int> rel) {
+    lock_guard<mutex> lock(mtx);
+    cout << "Process " << pid << " releases ";
+    for (int i = 0; i < num_resources; ++i) cout << rel[i] << " ";
 
+    for (int i = 0; i < num_resources; ++i) {
+        if (rel[i] > Allocation[pid][i]) {
+            cout << ": denied (invalid release)\n";
+            return false;
+        }
+    }
+    for (int i = 0; i < num_resources; ++i) {
+        Available[i] += rel[i];
+        Allocation[pid][i] -= rel[i];
+        Need[pid][i] += rel[i];
+    }
+    cout << ": done\n";
+    return true;
+}
 
-        // Create the Banker's Algorithm data structures, in any
-        // way you like as long as they have the correct size
-        // (unfortunately, you might not be able to use sscanf for this...)
+void auto_process(int pid) {
+    default_random_engine gen(chrono::system_clock::now().time_since_epoch().count() + pid);
+    uniform_int_distribution<int> dist(0, 3);
+    for (int i = 0; i < 3; ++i) {
+        vector<int> req(num_resources), rel(num_resources);
+        for (int j = 0; j < num_resources; ++j)
+            req[j] = min(dist(gen), Need[pid][j]);
+        request_resources(pid, req);
 
-        // 3. Use the rest of the setup file to initialize the data structures
+        this_thread::sleep_for(chrono::milliseconds(100));
 
+        for (int j = 0; j < num_resources; ++j)
+            rel[j] = min(dist(gen), Allocation[pid][j]);
+        release_resources(pid, rel);
 
-        // Done reading the file, so close it
-        setup_file.close();
-    } // end: if setup_file.is_open()
+        this_thread::sleep_for(chrono::milliseconds(100));
+    }
+}
 
-    // 4. Check initial conditions to ensure that the system is
-    // beginning in a safe state: see "Check initial conditions"
-    // in the Program 3 instructions
+void run_manual_mode() {
+    string command;
+    while (true) {
+        cout << "Enter command: ";
+        getline(cin, command);
+        if (command == "end") break;
 
-    // 5. Go into either manual or automatic mode, depending on
-    // the value of args[0]; you could implement these two modes
-    // as separate methods within this class, as separate classes
-    // with their own main methods, or as additional code within
-    // this main method.
-    
-    return 0; // terminate normally
+        stringstream ss(command);
+        string type;
+        int amount, res, pid;
+        ss >> type >> amount >> command >> res >> command >> pid;
+        vector<int> vec(num_resources, 0);
+        vec[res] = amount;
+        if (type == "request")
+            request_resources(pid, vec);
+        else if (type == "release")
+            release_resources(pid, vec);
+    }
+}
+
+void read_setup(const string& filename) {
+    ifstream in(filename);
+    string dummy;
+
+    in >> num_resources >> dummy;
+    in >> num_processes >> dummy;
+
+    in >> dummy;
+    Available.resize(num_resources);
+    for (int& x : Available) in >> x;
+
+    in >> dummy;
+    Max.assign(num_processes, vector<int>(num_resources));
+    for (auto& row : Max) for (int& x : row) in >> x;
+
+    in >> dummy;
+    Allocation.assign(num_processes, vector<int>(num_resources));
+    for (auto& row : Allocation) for (int& x : row) in >> x;
+
+    Need = Max;
+    for (int i = 0; i < num_processes; ++i)
+        for (int j = 0; j < num_resources; ++j)
+            Need[i][j] -= Allocation[i][j];
+}
+
+int main(int argc, char* argv[]) {
+    if (argc != 3) {
+        cerr << "Usage: " << argv[0] << " <manual|auto> <setupfile>\n";
+        return 1;
+    }
+
+    string mode = argv[1];
+    read_setup(argv[2]);
+
+    if (!is_safe()) {
+        cerr << "Initial state is not safe. Exiting.\n";
+        return 1;
+    }
+
+    if (mode == "manual") {
+        run_manual_mode();
+    }
+    else if (mode == "auto") {
+        vector<thread> threads;
+        for (int i = 0; i < num_processes; ++i)
+            threads.emplace_back(auto_process, i);
+        for (auto& t : threads) t.join();
+    }
+    else {
+        cerr << "Unknown mode: " << mode << endl;
+        return 1;
+    }
+
+    return 0;
 }
